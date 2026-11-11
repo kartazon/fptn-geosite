@@ -1,0 +1,97 @@
+name: Build geosite
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - main.go
+      - .github/workflows/build-geosite.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fptn-geosite
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_URL: https://raw.githubusercontent.com/fptn-project/fptn/refs/heads/master/deploy/domain_blacklist/russia.txt
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and compare source
+        id: source
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          curl --fail --location --retry 3 --connect-timeout 20 --max-time 180 "$SOURCE_URL" -o dist/russia.txt
+          test -s dist/russia.txt
+          (cd dist && sha256sum russia.txt > source.sha256)
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("fptn-"))) | [.created_at,.tag_name] | @tsv' > releases.tsv
+          latest=$(sort -r releases.tsv | head -n 1 | cut -f2)
+          changed=true
+          if [[ -n "$latest" ]]; then
+            mkdir -p previous
+            gh release download "$latest" --pattern source.sha256 --dir previous
+            if cmp -s dist/source.sha256 previous/source.sha256; then changed=false; fi
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then changed=true; fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          if [[ "$changed" == false ]]; then echo 'Source unchanged; build skipped.' >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/setup-go@v5
+        if: steps.source.outputs.changed == 'true'
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Build and verify
+        if: steps.source.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          go mod init github.com/${GITHUB_REPOSITORY}
+          go get github.com/v2fly/v2ray-core/v5/app/router/routercommon@latest
+          go mod tidy
+          go run .
+          cp go.mod go.sum dist/
+          (cd dist && sha256sum geosite.dat > geosite.dat.sha256)
+          export SOURCE_SHA256=$(cut -d' ' -f1 dist/source.sha256)
+          python3 - <<'PY'
+          import datetime, json, os, pathlib
+          info = {
+              'source_url': os.environ['SOURCE_URL'],
+              'source_sha256': os.environ['SOURCE_SHA256'],
+              'built_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'builder_commit': os.environ['GITHUB_SHA'],
+              'tag': 'fptn-blacklist',
+              'domain_count': len(pathlib.Path('dist/domains.txt').read_text().splitlines()),
+              'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }
+          pathlib.Path('dist/build-info.json').write_text(json.dumps(info, indent=2)+'\n')
+          PY
+      - name: Publish release
+        if: steps.source.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          tag="fptn-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" dist/* --target "$GITHUB_SHA" --title "FPTN geosite $(date -u +%Y-%m-%dT%H:%M:%SZ)" --notes "Single category: fptn-blacklist. Domain rules include subdomains. Source SHA-256: $(cut -d' ' -f1 dist/source.sha256)." --draft
+          gh release edit "$tag" --draft=false --latest
+          echo "Published: $tag" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain current and ten previous releases
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("fptn-"))) | [.created_at,.tag_name] | @tsv' > retention.tsv
+          sort -r retention.tsv | tail -n +12 | cut -f2 > delete-tags.txt
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            gh release delete "$tag" --yes --cleanup-tag
+          done < delete-tags.txt
